@@ -157,26 +157,80 @@ export default function App() {
     return numerator / denominator;
   }, [targetCorpus, deferredState.currentCorpus, deferredState.retirementAge, deferredState.currentAge, portfolioReturn, isValidAllocation]);
 
-  const recommendedAllocation = useMemo(() => {
-    const others = 10;
-    const equity = Math.max(10, Math.min(70, 80 - deferredState.currentAge));
-    const debt = 100 - others - equity;
-    
-    const overallReturn = (
-      (equity * deferredState.equityReturn) +
-      (debt * deferredState.debtReturn) +
-      (others * deferredState.otherReturn)
-    ) / 100;
+  const strategyReturns = useMemo(() => {
+    const getReturnForAge = (age: number) => {
+      const { equity: baseEquity, debt: baseDebt } = getInterpolatedAllocation(age, selectedStrategy);
+      const othersValue = deferredState.otherAllocation;
+      let equity = baseEquity;
+      let debt = baseDebt;
+      let others = 0;
 
-    return {
-      data: [
-        { name: 'Equity', value: equity, color: '#3b82f6' },
-        { name: 'Debt', value: debt, color: '#10b981' },
-        { name: 'Others', value: others, color: '#f59e0b' },
-      ],
-      overallReturn
+      if (othersHandling === 'separate') {
+        const scale = (100 - othersValue) / 100;
+        equity = baseEquity * scale;
+        debt = baseDebt * scale;
+        others = othersValue;
+      } else if (othersHandling === 'add_to_equity') {
+        const scale = (100 - othersValue) / 100;
+        equity = (baseEquity * scale) + othersValue;
+        debt = baseDebt * scale;
+        others = 0;
+      } else if (othersHandling === 'add_to_debt') {
+        const scale = (100 - othersValue) / 100;
+        equity = baseEquity * scale;
+        debt = (baseDebt * scale) + othersValue;
+        others = 0;
+      }
+
+      return (
+        (equity * deferredState.equityReturn) +
+        (debt * deferredState.debtReturn) +
+        (others * deferredState.otherReturn)
+      ) / 100;
     };
-  }, [deferredState.currentAge, deferredState.equityReturn, deferredState.debtReturn, deferredState.otherReturn]);
+
+    // Accumulation average return
+    let accTotal = 0;
+    let accYears = 0;
+    for (let age = deferredState.currentAge; age < deferredState.retirementAge; age++) {
+      accTotal += getReturnForAge(age);
+      accYears++;
+    }
+    const accumulationReturn = accYears > 0 ? accTotal / accYears : portfolioReturn;
+
+    // Retirement average return
+    let retTotal = 0;
+    let retYears = 0;
+    for (let age = deferredState.retirementAge; age < deferredState.retirementAge + deferredState.yearsInRetirement; age++) {
+      retTotal += getReturnForAge(age);
+      retYears++;
+    }
+    const retirementReturn = retYears > 0 ? retTotal / retYears : portfolioReturn;
+
+    return { accumulationReturn, retirementReturn };
+  }, [deferredState, selectedStrategy, othersHandling, portfolioReturn]);
+
+  const strategyTargetCorpus = useMemo(() => {
+    const monthlyReturn = (strategyReturns.retirementReturn / 100) / 12;
+    const monthlyInflation = (deferredState.inflationRate / 100) / 12;
+    const yearsToRetirement = deferredState.retirementAge - deferredState.currentAge;
+    
+    let firstMonthlyWithdrawal = 0;
+    if (deferredState.withdrawalMode === 'amount') {
+      firstMonthlyWithdrawal = deferredState.monthlyWithdrawalAmount * Math.pow(1 + (deferredState.inflationRate / 100), yearsToRetirement);
+    } else {
+      const annualLifestyleAtRetirement = (deferredState.monthlyWithdrawalAmount * 12) * Math.pow(1 + (deferredState.inflationRate / 100), yearsToRetirement);
+      return annualLifestyleAtRetirement / (deferredState.withdrawalRate / 100);
+    }
+    
+    const n = deferredState.yearsInRetirement * 12;
+    const r = monthlyReturn;
+    const g = monthlyInflation;
+    
+    if (r === g) return firstMonthlyWithdrawal * n;
+    const ratio = (1 + g) / (1 + r);
+    return firstMonthlyWithdrawal * (1 - Math.pow(ratio, n)) / (1 - ratio);
+  }, [deferredState, strategyReturns.retirementReturn]);
 
   const allocationTimeline = useMemo(() => {
     const timeline = [];
@@ -197,12 +251,14 @@ export default function App() {
         debt = baseDebt * scale;
         others = othersValue;
       } else if (othersHandling === 'add_to_equity') {
-        equity = baseEquity;
-        debt = baseDebt;
+        const scale = (100 - othersValue) / 100;
+        equity = (baseEquity * scale) + othersValue;
+        debt = baseDebt * scale;
         others = 0;
       } else if (othersHandling === 'add_to_debt') {
-        equity = baseEquity;
-        debt = baseDebt;
+        const scale = (100 - othersValue) / 100;
+        equity = baseEquity * scale;
+        debt = (baseDebt * scale) + othersValue;
         others = 0;
       }
 
@@ -218,7 +274,7 @@ export default function App() {
   }, [deferredState.currentAge, deferredState.retirementAge, deferredState.yearsInRetirement, selectedStrategy, othersHandling, deferredState.otherAllocation]);
 
   const recommendedFeasibility = useMemo(() => {
-    const monthlyReturn = (recommendedAllocation.overallReturn / 100) / 12;
+    const monthlyReturn = (strategyReturns.accumulationReturn / 100) / 12;
     const monthsToRetirement = (deferredState.retirementAge - deferredState.currentAge) * 12;
     
     if (monthsToRetirement <= 0) return { achievable: true, sip: 0 };
@@ -228,7 +284,7 @@ export default function App() {
       corpusNoSip += corpusNoSip * monthlyReturn;
     }
 
-    const gap = Math.max(0, targetCorpus - corpusNoSip);
+    const gap = Math.max(0, strategyTargetCorpus - corpusNoSip);
     
     if (gap === 0) return { achievable: true, sip: 0 };
     
@@ -241,7 +297,7 @@ export default function App() {
       sip: requiredSip,
       isBetter: requiredSip < requiredSIP
     };
-  }, [recommendedAllocation.overallReturn, deferredState, targetCorpus, requiredSIP]);
+  }, [strategyReturns.accumulationReturn, strategyTargetCorpus, deferredState, requiredSIP]);
 
   const results = useMemo(() => {
     if (!isValidAllocation) return [];
